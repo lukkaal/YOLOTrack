@@ -1,4 +1,4 @@
-# ROS2 Yolov5 + BodyControlNode 联动笔记整理
+# ROS2 Yolov5Node + BodyControlNode
 
 ## 1. 等待依赖服务
 
