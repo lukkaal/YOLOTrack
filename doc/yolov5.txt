@@ -1,0 +1,31 @@
+1) __init__(self, engine_file_path, plugin, classes, conf_thresh=0.6, iou_threshold=0.4)
+用来加载engine lib 和 classes 等参数
+
+2) TensorRT 引入了自定义插件（如激活函数、解码算子等），必须先通过 ctypes.CDLL 加载对应的动态链接库
+
+3) self.ctx = cuda.Device(0).make_context() stream = cuda.Stream() 其中 self.ctx 保证后续所有 CUDA 调用都在同一个上下文中执行，而 stream 用于异步管理数据拷贝和推理执行。
+
+4) TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+   runtime = trt.Runtime(TRT_LOGGER)
+   with open(self.engine_file_path, "rb") as f:
+      engine = runtime.deserialize_cuda_engine(f.read())
+   context = engine.create_execution_context()
+ 构建 trt.Runtime 并从 .engine 文件中恢复序列化好的网络结构和权重。
+ 通过 engine.create_execution_context() 获得可执行上下文。
+ 
+5) 分配主机与设备缓冲区 for binding in engine 包括对每个输入/输出张量，计算所需元素数量，并在主机端分配页锁定内存（加速 DMA）以及在设备端分配显存，记录模型输入的宽高，用于图像预处理。
+
+
+推理入口 infer()
+1) 上下文管理 self.ctx.push()/ self.ctx.pop()
+
+2) cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
+   context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+   cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
+   stream.synchronize()
+   将主机输入异步拷贝至显存，调用 execute_async 并行执行网络计算，再将结果拷回主机，最后同步等待完成。
+   
+3) boxes = []
+   scores = []
+   classid = []
+result_boxes, result_scores, result_classid = self.post_process(output[i * LEN_ALL_RESULT: (i + 1) * LEN_ALL_RESULT], batch_origin_h[i], batch_origin_w[i]) 经过函数 post_process 之后得到的是三个列表[]

@@ -1,0 +1,73 @@
+class Yolov5Node(Node)
+1) 在 launch 当中实际开启服务的时候 Node() 当中的 parameters 参数会将实际用到的参数传入结点
+而在实际编写结点的时候 需要预留位置即使用 self.get_parameter.value 读取
+self.yolov5 = YoLov5TRT(os.path.join(MODE_PATH, engine), os.path.join(MODE_PATH, lib), self.classes, conf_thresh)
+使用yolov5TRT的 infer 来进行推理
+
+
+2) self.bgr_image = None
+   self.start = False 控制是否开始检测
+   self.running = True 用于线程退出判断
+   self.bridge = CvBridge() 用于 ROS 图像消息与 OpenCV 之间转换
+   self.image_queue = queue.Queue(maxsize=2) 实现图像缓冲，容量 2 帧，保证稳定的消费速率
+   self.fps = fps.FPS()
+   signal.signal(signal.SIGINT, self.shutdown) 在 Ctrl+C 时调用 shutdown 进行优雅退出
+
+3) 从参数服务器获取引擎文件名、插件库路径、置信度阈值和类别列表，将它们传给前文封装好的 YoLov5TRT，完成 TensorRT 引擎的反序列化与缓冲区分配。
+
+4) threading.Thread(target=self.image_proc, daemon=True).start()
+   self.get_logger().info('start')
+   启动一个守护线程持续处理队列中的图像，实现生产（image_callback）与消费（image_proc）分离。
+   
+5) self.object_pub = self.create_publisher(ObjectsInfo, '~/object_detect', 1)
+   self.result_image_pub= self.create_publisher(Image,       '~/object_image', 1)
+   发布检测结果 (ObjectsInfo 消息) 和绘制了 FPS/检测框的可视化图像
+   
+关于 订阅 subscribe 和 发布 publish 服务
+在 ROS2 中，订阅某个话题后，一旦有新的消息发布到该话题，回调函数（callback）就会自动被调用
+
+6) image_proc(self) 后台线程循环消费图像队列，并执行目标检测、结果发布与可视化 while self.running
+   重点：发布代码 self.object_pub.publish(object_msg) 发布的 objects_info 是一个包含了多个 ObjectInfo 对象的 Python 列表 
+   
+7)  node = Yolov5Node('yolov5')
+    rclpy.spin(node) 只要 rclpy.spin(node) 在运行，节点就一直接收图像、处理推理、发布结果。除非按下 Ctrl+C，会触发 接下来等 shutdown()逻辑
+    node.destroy_node()
+    rclpy.shutdown()
+    
+总而言之 该节点完成了以下的逻辑
+create_service 创建服务 start | end 和 stat
+在 body_track.py 文件当中有使用到 self.client = self.create_client(Trigger, '/yolov5/start') 用于开启 yolo 结点
+-> image_proc -> if self.start -> objects_info
+
+/yolov5/start	std_srvs/srv/Trigger	start_srv_callback	启动目标检测
+/yolov5/stop	std_srvs/srv/Trigger	stop_srv_callback	停止目标检测
+~/init_finish	std_srvs/srv/Trigger	get_node_state	返回节点初始化完成状态
+ 
+create_publisher 发布了一个话题
+~/object_detect	interfaces/msg/ObjectsInfo	发布识别到的目标信息
+~/object_image	sensor_msgs/msg/Image	发布带有检测框和 FPS 的图像
+
+create_subscription 订阅一个话题
+/depth_cam/rgb/image_raw 或 /usb_cam/image_raw	sensor_msgs/msg/Image	订阅摄像头图像（根据参数 use_depth 决定是哪个相机）
+
+Node 创建一个话题 同时也负责更新这个话题 self.object_pub.publish(object_msg) 以便于让订阅话题的结点可以触发回调函数
+
+
+       +----------------------------+
+       |        Yolov5Node         |
+       +----------------------------+
+        |     ^        ^        ^
+        |     |        |        |
+     Sub:  Image   Srv: Start  Srv: Stop
+        |             |        |
+        v             v        v
+  image_callback()   start_srv_callback()
+                      stop_srv_callback()
+
+       ^                              |
+       |                              |
+   Pub: object_detect         Srv: ~/init_finish
+   Pub: object_image           --> get_node_state()
+
+         后台线程：
+         image_proc()

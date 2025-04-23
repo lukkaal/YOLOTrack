@@ -1,0 +1,110 @@
+1) 等待依赖服务
+self.client = self.create_client(Trigger, '/controller_manager/init_finish')
+self.client.wait_for_service()
+self.client = self.create_client(Trigger, '/yolov5/start')
+self.client.wait_for_service()
+--> BodyControlNode 首先等待 /controller_manager/init_finish，确保机械臂就绪。
+然后等待 /yolov5/start 服务上线，确保 Yolov5Node 已经创建了这个服务端(开启服务)。
+
+2) 触发 YOLO 开始检测
+self.future = self.client.call_async(Trigger.Request())  # 调用 /yolov5/start
+rclpy.spin_until_future_complete(self, self.future)
+--> BodyControlNode 以客户端（Client）身份，发送一个空的 Trigger 请求到 /yolov5/start。
+Yolov5Node 的 start_srv_callback 被触发，将内部 self.start = True，从此开始向下游发布检测结果。
+
+3) 话题层面的联动
+发布者	话题	消息类型	订阅者
+Yolov5Node	/yolov5/object_detect	interfaces/msg/ObjectsInfo	BodyControlNode (get_object_callback)
+Yolov5Node	/yolov5/object_image	sensor_msgs/msg/Image	BodyControlNode (image_callback)
+BodyControlNode (相机)	/depth_cam/depth/image_raw	sensor_msgs/msg/Image	BodyControlNode (depth_image_callback)
+
+YOLO 节点发布
+
+当 start=True 时，image_proc 每帧都会发布两种消息：
+ObjectsInfo（检测到的所有人目标的 box、score、class_name 列表）
+带框的 Image（用于实时可视化）
+
+
+BodyControlNode 订阅
+/yolov5/object_detect → get_object_callback
+提取第一个 class_name == 'person' 的框中心，用来后续追踪和深度测距。
+/yolov5/object_image → image_callback
+获取彩色画面流，用于在同一线程中做可视化和键盘中断监测。
+/depth_cam/depth/image_raw → depth_image_callback
+获取深度图，用来在检测到的 ROI 上计算平均深度。
+
+
+BodyControlNode                         Yolov5Node
+      │                                        │
+      │ -- wait_for_service(/yolov5/start) --> │
+      │                                        │
+      │ -- call_async(Trigger) ------------→  │ 启动检测
+      │                                        │
+      │                                        │
+      │ <— /yolov5/object_detect (ObjectsInfo) — │
+      │ <— /yolov5/object_image  (Image)       — │
+      │                                        │
+      │ 处理并发布 /controller/cmd_vel → 底盘驱动│
+      │                                        │
+      │                             （循环）    │
+      
+服务 /yolov5/start：BodyControlNode 调用，通知 Yolov5Node “开始检测并发布”
+话题 /yolov5/object_detect 和 /yolov5/object_image：Yolov5Node 发布检测结果，BodyControlNode 订阅处理
+
+如此，两个节点就形成了一个“先服务初始化→再实时数据流→产生控制命令→驱动机器” 的闭环。
+
+4) threading.Thread(target=self.main, daemon=True).start()
+新线程是为了从图像队列中独立处理视觉控制流程，它的任务和 ROS2 的订阅回调解耦，使得同时监听图像和深度输入/后台进行目标跟踪与底盘控制/并发处理，不卡住主线程的 ROS 回调机制
+
+image_proc() 会根据图像中检测到的人，结合深度图画圈、框出目标读取 ROI 的深度/调用 PID 控制计算出合适的线速度 linear.x 和角速度 angular.z
+/然后通过 self.mecanum_pub.publish(twist) 发布到底盘控制话题
+
+
+5) 按下 Ctrl+C → 整个进程收到 SIGINT
+
+主线程
+ROS2 的 spin() 退出/执行 destroy_node() + rclpy.shutdown()
+
+后台线程
+Python 的 SIGINT 处理器把 self.running 置为 False
+while self.running: 循环结束/线程自然退出（是 daemon=True，但主线程退出时它也会随进程结束）
+
+6) 不同线程的分工
+ROS 初始化与构造
+
+BodyControlNode.__init__() 里调用 rclpy.init()，创建订阅者、发布者、服务客户端和服务端、ActionGroupController 等。
+同步等待 /yolov5/start 服务，触发 YOLO 节点开始检测。
+
+1.ROS 事件循环 (rclpy.spin)
+进入 Single-Threaded Executor，循环监听并分发
+
+订阅回调
+image_callback：把图像放入队列
+depth_image_callback：把深度图保存到 self.depth_frame
+get_object_callback：把 YOLO 检测出的“人”中心点写入 self.center
+
+服务回调
+get_node_state（~/init_finish）：上游询问节点是否就绪
+
+主线程不做任何重量级计算，只负责这些小回调的迅速调度。
+
+优雅退出
+当外部 Ctrl+C 发出 SIGINT，rclpy.spin 返回，接着调用 destroy_node() + rclpy.shutdown()，关闭 ROS。
+
+2.背景线程（Worker Thread）
+不断循环，从 image_callback 放进去的 self.image_queue 中抓帧，执行完整的视觉—控制逻辑
+图像处理
+image_proc 会：
+在彩色图上画出检测到的人中心点
+用 self.depth_frame 中相应 ROI 计算平均距离
+调用两个 PID 控制器，生成底盘运动命令 Twist 并发布 /controller/cmd_vel
+
+退出检测
+检测到键盘 ‘q’/ESC 时，把 self.running=False，跳出循环。
+
+
+7) 后台线程里再调用一次 rclpy.shutdown()的原因?
+双路退出保护：
+主线程里 rclpy.spin(node) 结束后会走到外层的 rclpy.shutdown()，但如果你在后台线程里按了 “q” 或 ESC，让 self.running=False，主线程的 spin() 并不会立刻返回（因为它没收到 SIGINT），此时后台线程自己退出循环后也要把 ROS 停了，避免进程挂起。
+
+rclpy.shutdown() 的实现是幂等的（多次调用等同于一次），且内部做了线程同步，它会检查 “是否已经关闭” 这个状态，再决定要不要真的走清理逻辑。
